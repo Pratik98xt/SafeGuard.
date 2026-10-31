@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "243732535410",
+    "project_id": "safeguard-f0890",
+    "storage_bucket": "safeguard-f0890.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:243732535410:android:c13b60b86928b7e4c40aeb",
+        "android_client_info": {
+          "package_name": "com.example.women_safety"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAidOILZpmyKT2cIBrAXiDPKIFFDVgWLBM"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

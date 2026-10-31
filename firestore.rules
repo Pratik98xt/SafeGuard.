@@ -1,0 +1,456 @@
+rules_version = '2';
+
+// ===============================================================
+// Assumed Data Model
+// ===============================================================
+//
+// Collection: users
+// Document ID: userId (Auth UID)
+// Fields:
+//   - uid: string (required, immutable) - Must match request.auth.uid
+//   - name: string (required, 1..100 chars) - User's display name
+//   - email: string (required, valid email format, max 254 chars)
+//   - phone: string (required, 3..25 chars) - User's phone number
+//   - role: string (required, allowed: 'woman', 'child', 'guardian')
+//   - profileImage: string (optional, URL or path, max 1000 chars)
+//   - linkedUserIds: list of strings (optional, max 50 items) - UIDs of linked guardians/wards
+//   - emergencyContacts: list of strings (optional, max 50 items)
+//   - latitude: number (optional, -90.0 to 90.0)
+//   - longitude: number (optional, -180.0 to 180.0)
+//   - batteryLevel: int (optional, 0 to 100)
+//   - lastSeen: string (ISO 8601, max 60 chars) or timestamp (optional)
+//   - guardianId: string (optional, immutable once set, max 50 chars) - e.g. GDN123456
+//   - address: string (optional, max 300 chars)
+//
+// Collection: guardian_requests
+// Document ID: requestId (generated string or timestamp ID)
+// Fields:
+//   - id: string (required, immutable)
+//   - fromId: string (required, immutable) - Sender Auth UID
+//   - toId: string (required, immutable) - Receiver Auth UID
+//   - fromName: string (required, immutable, 1..100 chars)
+//   - fromPhone: string (required, immutable, 3..25 chars)
+//   - fromRole: string (required, immutable, 'woman'|'child'|'guardian')
+//   - status: string (required, 'pending'|'accepted'|'rejected')
+//   - timestamp: string (ISO 8601, max 60 chars) or timestamp (required, immutable)
+//
+// Collection: notifications
+// Document ID: notificationId
+// Fields:
+//   - id: string (required, immutable)
+//   - type: string (required, immutable, 1..50 chars)
+//   - senderId: string (required, immutable, Auth UID)
+//   - senderName: string (required, immutable, 1..100 chars)
+//   - receiverId: string (optional, immutable, Auth UID)
+//   - message: string (required, max 500 chars)
+//   - timestamp: string (ISO 8601, max 60 chars) or timestamp (required, immutable)
+//   - status: string (required, 'unread'|'read'|'resolved'|'active')
+//   - location: map with 'lat' and 'lon' (optional)
+//   - latitude: number (optional)
+//   - longitude: number (optional)
+//   - userId: string (optional, compatibility)
+//   - userName: string (optional, compatibility)
+//
+// Subcollections:
+//   child_emergency_contacts/{userId}/contacts/{contactId}
+//   women_emergency_contacts/{userId}/contacts/{contactId}
+// Fields:
+//   - name: string (required, 1..100 chars)
+//   - phone: string (required, 3..25 chars)
+//   - id: string (optional, max 128 chars)
+//
+// Collection: community_posts
+// Document ID: postId
+// Fields:
+//   - userId: string (required, immutable, Auth UID)
+//   - userName: string (required, 1..100 chars)
+//   - content: string (required, 1..2000 chars)
+//   - isUrgent: bool (required)
+//   - likes: int (required, >= 0)
+//   - timestamp: timestamp or string (required, immutable)
+//
+// Collection: community_notifications
+// Document ID: notificationId
+// Fields:
+//   - userId: string (required, immutable, Auth UID)
+//   - userName: string (required, 1..100 chars)
+//   - message: string (required, max 500 chars)
+//   - latitude: number (required, -90.0 to 90.0)
+//   - longitude: number (required, -180.0 to 180.0)
+//   - type: string (required, immutable, 1..50 chars)
+//   - timestamp: timestamp or string (required, immutable)
+//
+// Collection: public_locations
+// Document ID: userId (Auth UID)
+// Fields:
+//   - uid: string (required, immutable) - Must match request.auth.uid
+//   - name: string (required, 1..100 chars) - User's display name
+//   - role: string (required, 'woman' | 'child' | 'guardian')
+//   - latitude: number (required, -90.0 to 90.0)
+//   - longitude: number (required, -180.0 to 180.0)
+//   - lastUpdated: timestamp or string (optional, max 60 chars if string)
+//
+// ===============================================================
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Default deny all reads and writes
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function hasRequiredFields(fields) {
+      return request.resource.data.keys().hasAll(fields);
+    }
+
+    function hasOnlyAllowedFields(fields) {
+      return request.resource.data.keys().hasOnly(fields);
+    }
+
+    function areImmutableFieldsUnchanged(fields) {
+      return !request.resource.data.diff(resource.data).affectedKeys().hasAny(fields);
+    }
+
+    function isValidEmail(email) {
+      return email is string &&
+        email.size() >= 3 &&
+        email.size() <= 254 &&
+        email.matches('^[a-zA-Z0-9._%+\\-]+@[a-zA-Z0-9.\\-]+\\.[a-zA-Z]{2,}$');
+    }
+
+    function isValidPhone(phone) {
+      return phone is string &&
+        phone.size() >= 3 &&
+        phone.size() <= 25 &&
+        phone.matches('^\\+?[0-9\\s\\-\\(\\)]{3,25}$');
+    }
+
+    // ===============================================================
+    // Domain Validators (Applied on BOTH create and update)
+    // ===============================================================
+
+    function isValidUser(data) {
+      return data.keys().hasAll(['uid', 'name', 'email', 'phone', 'role']) &&
+        data.keys().hasOnly([
+          'uid', 'name', 'email', 'phone', 'role',
+          'profileImage', 'linkedUserIds', 'emergencyContacts',
+          'latitude', 'longitude', 'batteryLevel', 'lastSeen',
+          'guardianId', 'address'
+        ]) &&
+        data.uid is string && data.uid.size() >= 1 && data.uid.size() <= 128 &&
+        data.name is string && data.name.size() >= 1 && data.name.size() <= 100 &&
+        isValidEmail(data.email) &&
+        isValidPhone(data.phone) &&
+        data.role in ['woman', 'child', 'guardian'] &&
+        (!('profileImage' in data) || data.profileImage == null || (data.profileImage is string && data.profileImage.size() <= 1000)) &&
+        (!('linkedUserIds' in data) || (data.linkedUserIds is list && data.linkedUserIds.size() <= 50)) &&
+        (!('emergencyContacts' in data) || (data.emergencyContacts is list && data.emergencyContacts.size() <= 50)) &&
+        (!('latitude' in data) || data.latitude == null || (data.latitude is number && data.latitude >= -90.0 && data.latitude <= 90.0)) &&
+        (!('longitude' in data) || data.longitude == null || (data.longitude is number && data.longitude >= -180.0 && data.longitude <= 180.0)) &&
+        (!('batteryLevel' in data) || data.batteryLevel == null || (data.batteryLevel is int && data.batteryLevel >= 0 && data.batteryLevel <= 100)) &&
+        (!('lastSeen' in data) || data.lastSeen == null || (data.lastSeen is string && data.lastSeen.size() <= 60) || data.lastSeen is timestamp) &&
+        (!('guardianId' in data) || data.guardianId == null || (data.guardianId is string && data.guardianId.size() <= 50)) &&
+        (!('address' in data) || data.address == null || (data.address is string && data.address.size() <= 300));
+    }
+
+    // Helper checking whether an external updater is only adding themselves to linkedUserIds
+    function isLinkingSelf(userId) {
+      return isAuthenticated() &&
+        request.auth.uid != userId &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['linkedUserIds']) &&
+        request.resource.data.linkedUserIds is list &&
+        request.resource.data.linkedUserIds.size() <= 50 &&
+        request.auth.uid in request.resource.data.linkedUserIds &&
+        (
+          !('linkedUserIds' in resource.data) ||
+          (
+            request.resource.data.linkedUserIds.hasAll(resource.data.linkedUserIds) &&
+            request.resource.data.linkedUserIds.size() <= resource.data.linkedUserIds.size() + 1
+          )
+        );
+    }
+
+    function isValidGuardianRequest(data) {
+      return data.keys().hasAll(['id', 'fromId', 'toId', 'fromName', 'fromPhone', 'fromRole', 'status', 'timestamp']) &&
+        data.keys().hasOnly(['id', 'fromId', 'toId', 'fromName', 'fromPhone', 'fromRole', 'status', 'timestamp']) &&
+        data.id is string && data.id.size() >= 1 && data.id.size() <= 128 &&
+        data.fromId is string && data.fromId.size() >= 1 && data.fromId.size() <= 128 &&
+        data.toId is string && data.toId.size() >= 1 && data.toId.size() <= 128 &&
+        data.fromName is string && data.fromName.size() >= 1 && data.fromName.size() <= 100 &&
+        isValidPhone(data.fromPhone) &&
+        data.fromRole in ['woman', 'child', 'guardian'] &&
+        data.status in ['pending', 'accepted', 'rejected'] &&
+        ((data.timestamp is string && data.timestamp.size() <= 60) || data.timestamp is timestamp);
+    }
+
+    function isValidNotification(data) {
+      return data.keys().hasAll(['id', 'type', 'senderId', 'senderName', 'message', 'timestamp', 'status']) &&
+        data.keys().hasOnly([
+          'id', 'type', 'senderId', 'senderName', 'receiverId',
+          'message', 'timestamp', 'status', 'location',
+          'latitude', 'longitude', 'userId', 'userName'
+        ]) &&
+        data.id is string && data.id.size() >= 1 && data.id.size() <= 128 &&
+        data.type is string && data.type.size() >= 1 && data.type.size() <= 50 &&
+        data.senderId is string && data.senderId.size() >= 1 && data.senderId.size() <= 128 &&
+        data.senderName is string && data.senderName.size() >= 1 && data.senderName.size() <= 100 &&
+        (!('receiverId' in data) || (data.receiverId is string && data.receiverId.size() >= 1 && data.receiverId.size() <= 128)) &&
+        data.message is string && data.message.size() <= 500 &&
+        data.status in ['unread', 'read', 'resolved', 'active'] &&
+        ((data.timestamp is string && data.timestamp.size() <= 60) || data.timestamp is timestamp) &&
+        (!('location' in data) || (data.location is map && data.location.keys().hasOnly(['lat', 'lon']) && data.location.lat is number && data.location.lon is number)) &&
+        (!('latitude' in data) || (data.latitude is number && data.latitude >= -90.0 && data.latitude <= 90.0)) &&
+        (!('longitude' in data) || (data.longitude is number && data.longitude >= -180.0 && data.longitude <= 180.0)) &&
+        (!('userId' in data) || (data.userId is string && data.userId.size() <= 128)) &&
+        (!('userName' in data) || (data.userName is string && data.userName.size() <= 100));
+    }
+
+    function isValidEmergencyContact(data) {
+      return data.keys().hasAll(['name', 'phone']) &&
+        data.keys().hasOnly(['name', 'phone', 'id']) &&
+        data.name is string && data.name.size() >= 1 && data.name.size() <= 100 &&
+        isValidPhone(data.phone) &&
+        (!('id' in data) || (data.id is string && data.id.size() <= 128));
+    }
+
+    function isValidCommunityPost(data) {
+      return data.keys().hasAll(['userId', 'userName', 'content', 'isUrgent', 'likes', 'timestamp']) &&
+        data.keys().hasOnly(['userId', 'userName', 'content', 'isUrgent', 'likes', 'timestamp']) &&
+        data.userId is string && data.userId.size() >= 1 && data.userId.size() <= 128 &&
+        data.userName is string && data.userName.size() >= 1 && data.userName.size() <= 100 &&
+        data.content is string && data.content.size() >= 1 && data.content.size() <= 2000 &&
+        data.isUrgent is bool &&
+        data.likes is int && data.likes >= 0 &&
+        ((data.timestamp is string && data.timestamp.size() <= 60) || data.timestamp is timestamp);
+    }
+
+    function isValidCommunityNotification(data) {
+      return data.keys().hasAll(['userId', 'userName', 'message', 'latitude', 'longitude', 'type', 'timestamp']) &&
+        data.keys().hasOnly(['userId', 'userName', 'message', 'latitude', 'longitude', 'type', 'timestamp']) &&
+        data.userId is string && data.userId.size() >= 1 && data.userId.size() <= 128 &&
+        data.userName is string && data.userName.size() >= 1 && data.userName.size() <= 100 &&
+        data.message is string && data.message.size() <= 500 &&
+        data.latitude is number && data.latitude >= -90.0 && data.latitude <= 90.0 &&
+        data.longitude is number && data.longitude >= -180.0 && data.longitude <= 180.0 &&
+        data.type is string && data.type.size() >= 1 && data.type.size() <= 50 &&
+        ((data.timestamp is string && data.timestamp.size() <= 60) || data.timestamp is timestamp);
+    }
+
+    function isValidPublicLocation(data) {
+      return data.keys().hasAll(['uid', 'name', 'role', 'latitude', 'longitude']) &&
+        data.keys().hasOnly(['uid', 'name', 'role', 'latitude', 'longitude', 'lastUpdated']) &&
+        data.uid is string && data.uid.size() >= 1 && data.uid.size() <= 128 && data.uid == request.auth.uid &&
+        data.name is string && data.name.size() >= 1 && data.name.size() <= 100 &&
+        data.role in ['woman', 'child', 'guardian'] &&
+        data.latitude is number && data.latitude >= -90.0 && data.latitude <= 90.0 &&
+        data.longitude is number && data.longitude >= -180.0 && data.longitude <= 180.0 &&
+        (!('lastUpdated' in data) || data.lastUpdated == null || (data.lastUpdated is string && data.lastUpdated.size() <= 60) || data.lastUpdated is timestamp);
+    }
+
+    // ===============================================================
+    // Collection Rules
+    // ===============================================================
+
+    // 1. Users Collection
+    match /users/{userId} {
+      // Reads: A user can read their own profile, profiles of users who linked them,
+      // or registered guardians (for discovery and linking).
+      allow read: if isAuthenticated() && (
+        request.auth.uid == userId ||
+        ('linkedUserIds' in resource.data &&
+         resource.data.linkedUserIds is list &&
+         request.auth.uid in resource.data.linkedUserIds) ||
+        ('role' in resource.data && resource.data.role == 'guardian')
+      );
+
+      // Create: User can create their own document with matching UID
+      allow create: if isOwner(userId) &&
+        isValidUser(request.resource.data) &&
+        request.resource.data.uid == userId;
+
+      // Update:
+      // Case A: Owner updating their own profile (UID is immutable; guardianId is immutable once set)
+      // Case B: Cross-user link acceptance where updater is only adding their own UID to linkedUserIds
+      allow update: if isValidUser(request.resource.data) && (
+        (
+          isOwner(userId) &&
+          request.resource.data.uid == resource.data.uid &&
+          (
+            !('guardianId' in resource.data) ||
+            resource.data.guardianId == null ||
+            request.resource.data.guardianId == resource.data.guardianId
+          )
+        ) ||
+        isLinkingSelf(userId)
+      );
+
+      // Deletes are disallowed to maintain audit trails and referential integrity
+      allow delete: if false;
+    }
+
+    // 2. Guardian Requests Collection
+    match /guardian_requests/{requestId} {
+      // Read: Sender or Receiver only
+      allow read: if isAuthenticated() && (
+        resource.data.fromId == request.auth.uid ||
+        resource.data.toId == request.auth.uid
+      );
+
+      // Create: Signed-in user as sender, initial status must be 'pending'
+      allow create: if isAuthenticated() &&
+        isValidGuardianRequest(request.resource.data) &&
+        request.resource.data.fromId == request.auth.uid &&
+        request.resource.data.status == 'pending';
+
+      // Update: Receiver (to accept/reject) or sender (to cancel), immutable identity & metadata fields
+      allow update: if isAuthenticated() &&
+        isValidGuardianRequest(request.resource.data) &&
+        (resource.data.toId == request.auth.uid || resource.data.fromId == request.auth.uid) &&
+        areImmutableFieldsUnchanged(['id', 'fromId', 'toId', 'fromName', 'fromPhone', 'fromRole', 'timestamp']);
+
+      // Delete: Sender or Receiver
+      allow delete: if isAuthenticated() && (
+        resource.data.fromId == request.auth.uid ||
+        resource.data.toId == request.auth.uid
+      );
+    }
+
+    // 3. Notifications Collection
+    match /notifications/{notificationId} {
+      // Read: Receiver or Sender (or userId compatibility field)
+      allow read: if isAuthenticated() && (
+        ('receiverId' in resource.data && resource.data.receiverId == request.auth.uid) ||
+        resource.data.senderId == request.auth.uid ||
+        (('userId' in resource.data) && resource.data.userId == request.auth.uid)
+      );
+
+      // Create: Authenticated sender matching senderId
+      allow create: if isAuthenticated() &&
+        isValidNotification(request.resource.data) &&
+        (
+          request.resource.data.senderId == request.auth.uid ||
+          (('userId' in request.resource.data) && request.resource.data.userId == request.auth.uid)
+        );
+
+      // Update: Receiver marking read or resolving, or sender
+      allow update: if isAuthenticated() &&
+        isValidNotification(request.resource.data) &&
+        (
+          ('receiverId' in resource.data && resource.data.receiverId == request.auth.uid) ||
+          resource.data.senderId == request.auth.uid
+        ) &&
+        areImmutableFieldsUnchanged(['id', 'senderId', 'receiverId', 'type', 'timestamp']);
+
+      // Delete: Receiver or Sender
+      allow delete: if isAuthenticated() && (
+        ('receiverId' in resource.data && resource.data.receiverId == request.auth.uid) ||
+        resource.data.senderId == request.auth.uid
+      );
+    }
+
+    // 4. Role-based Emergency Contacts
+    match /child_emergency_contacts/{userId} {
+      allow read, write: if isOwner(userId);
+
+      match /contacts/{contactId} {
+        allow read, delete: if isOwner(userId);
+        allow create, update: if isOwner(userId) && isValidEmergencyContact(request.resource.data);
+      }
+    }
+
+    match /women_emergency_contacts/{userId} {
+      allow read, write: if isOwner(userId);
+
+      match /contacts/{contactId} {
+        allow read, delete: if isOwner(userId);
+        allow create, update: if isOwner(userId) && isValidEmergencyContact(request.resource.data);
+      }
+    }
+
+    // 5. Community Posts Collection
+    match /community_posts/{postId} {
+      // Read: Any authenticated user
+      allow read: if isAuthenticated();
+
+      // Create: Authenticated user creating post for themselves with initial 0 likes
+      allow create: if isAuthenticated() &&
+        isValidCommunityPost(request.resource.data) &&
+        request.resource.data.userId == request.auth.uid &&
+        request.resource.data.likes == 0;
+
+      // Update:
+      // Case A: Owner editing post content/urgency (userId and timestamp immutable)
+      // Case B: Any authenticated user liking or unliking (+1 or -1 atomic change only)
+      allow update: if isAuthenticated() &&
+        isValidCommunityPost(request.resource.data) &&
+        (
+          (
+            isOwner(resource.data.userId) &&
+            areImmutableFieldsUnchanged(['userId', 'timestamp'])
+          ) ||
+          (
+            request.resource.data.diff(resource.data).affectedKeys().hasOnly(['likes']) &&
+            (
+              request.resource.data.likes == resource.data.likes + 1 ||
+              request.resource.data.likes == resource.data.likes - 1
+            )
+          )
+        );
+
+      // Delete: Post creator only
+      allow delete: if isAuthenticated() && isOwner(resource.data.userId);
+    }
+
+    // 6. Community Notifications Collection
+    match /community_notifications/{notificationId} {
+      // Read: Any authenticated user
+      allow read: if isAuthenticated();
+
+      // Create: Authenticated user broadcasting their own notification
+      allow create: if isAuthenticated() &&
+        isValidCommunityNotification(request.resource.data) &&
+        request.resource.data.userId == request.auth.uid;
+
+      // Update: Notification creator only (immutable type, userId, timestamp)
+      allow update: if isAuthenticated() &&
+        isOwner(resource.data.userId) &&
+        isValidCommunityNotification(request.resource.data) &&
+        areImmutableFieldsUnchanged(['userId', 'timestamp', 'type']);
+
+      // Delete: Notification creator only
+      allow delete: if isAuthenticated() && isOwner(resource.data.userId);
+    }
+
+    // 7. Public Locations Collection
+    match /public_locations/{userId} {
+      // Read: Any authenticated user
+      allow read: if isAuthenticated();
+
+      // Create: Only the owner can create their own public location
+      allow create: if isOwner(userId) &&
+        isValidPublicLocation(request.resource.data) &&
+        request.resource.data.uid == userId;
+
+      // Update: Only the owner can update their public location (UID is immutable)
+      allow update: if isOwner(userId) &&
+        isValidPublicLocation(request.resource.data) &&
+        request.resource.data.uid == resource.data.uid;
+
+      // Delete: Only the owner can delete their public location
+      allow delete: if isOwner(userId);
+    }
+  }
+}
